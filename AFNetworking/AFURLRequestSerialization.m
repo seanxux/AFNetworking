@@ -167,6 +167,7 @@ NSArray * AFQueryStringPairsFromKeyAndValue(NSString *key, id value) {
                     stringEncoding:(NSStringEncoding)encoding;
 
 - (NSMutableURLRequest *)requestByFinalizingMultipartFormData;
+- (NSMutableURLRequest *)requestByFinalizingMultipartFormData:(BOOL)removeBoundary;
 @end
 
 #pragma mark -
@@ -193,6 +194,8 @@ static void *AFHTTPRequestSerializerObserverContext = &AFHTTPRequestSerializerOb
 
 @implementation AFHTTPRequestSerializer
 
+@synthesize removeBoundary;
+
 + (instancetype)serializer {
     return [[self alloc] init];
 }
@@ -202,7 +205,7 @@ static void *AFHTTPRequestSerializerObserverContext = &AFHTTPRequestSerializerOb
     if (!self) {
         return nil;
     }
-
+    self.removeBoundary = false;
     self.stringEncoding = NSUTF8StringEncoding;
 
     self.mutableHTTPRequestHeaders = [NSMutableDictionary dictionary];
@@ -411,7 +414,9 @@ forHTTPHeaderField:(NSString *)field
     if (block) {
         block(formData);
     }
-
+    if (self.removeBoundary) {
+        [formData requestByFinalizingMultipartFormData:self.removeBoundary];
+    }
     return [formData requestByFinalizingMultipartFormData];
 }
 
@@ -632,6 +637,7 @@ NSTimeInterval const kAFUploadStream3GSuggestedDelay = 0.2;
 
 @property (nonatomic, assign) BOOL hasInitialBoundary;
 @property (nonatomic, assign) BOOL hasFinalBoundary;
+@property (nonatomic, assign) BOOL removeBoundary;
 
 @property (readonly, nonatomic, assign, getter = hasBytesAvailable) BOOL bytesAvailable;
 @property (readonly, nonatomic, assign) unsigned long long contentLength;
@@ -649,6 +655,7 @@ NSTimeInterval const kAFUploadStream3GSuggestedDelay = 0.2;
 
 - (instancetype)initWithStringEncoding:(NSStringEncoding)encoding;
 - (void)setInitialAndFinalBoundaries;
+- (void)setInitialAndFinalBoundaries:(BOOL)removeBoundary;
 - (void)appendHTTPBodyPart:(AFHTTPBodyPart *)bodyPart;
 @end
 
@@ -828,6 +835,22 @@ NSTimeInterval const kAFUploadStream3GSuggestedDelay = 0.2;
     return self.request;
 }
 
+- (NSMutableURLRequest *)requestByFinalizingMultipartFormData:(BOOL)removeBoundary {
+    if ([self.bodyStream isEmpty]) {
+        return self.request;
+    }
+    
+    //     Reset the initial and final boundaries to ensure correct Content-Length
+    [self.bodyStream setInitialAndFinalBoundaries:removeBoundary];
+    [self.request setHTTPBodyStream:self.bodyStream];
+    
+    [self.request setValue:[NSString stringWithFormat:@"multipart/form-data; boundary=%@", self.boundary] forHTTPHeaderField:@"Content-Type"];
+    
+    [self.request setValue:[NSString stringWithFormat:@"%llu", [self.bodyStream contentLength]] forHTTPHeaderField:@"Content-Length"];
+    
+    return self.request;
+}
+
 @end
 
 #pragma mark -
@@ -875,6 +898,22 @@ NSTimeInterval const kAFUploadStream3GSuggestedDelay = 0.2;
 
         [[self.HTTPBodyParts firstObject] setHasInitialBoundary:YES];
         [[self.HTTPBodyParts lastObject] setHasFinalBoundary:YES];
+    }
+}
+
+- (void)setInitialAndFinalBoundaries:(BOOL)removeBoundary
+{
+    if ([self.HTTPBodyParts count] > 0) {
+        for (AFHTTPBodyPart *bodyPart in self.HTTPBodyParts) {
+            bodyPart.hasInitialBoundary = NO;
+            bodyPart.hasFinalBoundary = NO;
+            bodyPart.removeBoundary = removeBoundary;
+        }
+        
+        [[self.HTTPBodyParts firstObject] setHasInitialBoundary:YES];
+        [[self.HTTPBodyParts lastObject] setHasFinalBoundary:YES];
+        [[self.HTTPBodyParts firstObject] setRemoveBoundary:removeBoundary];
+        [[self.HTTPBodyParts lastObject] setRemoveBoundary:removeBoundary];
     }
 }
 
@@ -1077,17 +1116,18 @@ typedef enum {
 - (unsigned long long)contentLength {
     unsigned long long length = 0;
 
-    NSData *encapsulationBoundaryData = [([self hasInitialBoundary] ? AFMultipartFormInitialBoundary(self.boundary) : AFMultipartFormEncapsulationBoundary(self.boundary)) dataUsingEncoding:self.stringEncoding];
-    length += [encapsulationBoundaryData length];
+    if (![self removeBoundary]) {
+        NSData *encapsulationBoundaryData = [([self hasInitialBoundary] ? AFMultipartFormInitialBoundary(self.boundary) : AFMultipartFormEncapsulationBoundary(self.boundary)) dataUsingEncoding:self.stringEncoding];
+        length += [encapsulationBoundaryData length];
 
-    NSData *headersData = [[self stringForHeaders] dataUsingEncoding:self.stringEncoding];
-    length += [headersData length];
+        NSData *headersData = [[self stringForHeaders] dataUsingEncoding:self.stringEncoding];
+        length += [headersData length];
 
+        NSData *closingBoundaryData = ([self hasFinalBoundary] ? [AFMultipartFormFinalBoundary(self.boundary) dataUsingEncoding:self.stringEncoding] : [NSData data]);
+        length += [closingBoundaryData length];
+    }
     length += _bodyContentLength;
-
-    NSData *closingBoundaryData = ([self hasFinalBoundary] ? [AFMultipartFormFinalBoundary(self.boundary) dataUsingEncoding:self.stringEncoding] : [NSData data]);
-    length += [closingBoundaryData length];
-
+    
     return length;
 }
 
@@ -1119,12 +1159,12 @@ typedef enum {
 
     if (_phase == AFEncapsulationBoundaryPhase) {
         NSData *encapsulationBoundaryData = [([self hasInitialBoundary] ? AFMultipartFormInitialBoundary(self.boundary) : AFMultipartFormEncapsulationBoundary(self.boundary)) dataUsingEncoding:self.stringEncoding];
-        totalNumberOfBytesRead += [self readData:encapsulationBoundaryData intoBuffer:&buffer[totalNumberOfBytesRead] maxLength:(length - (NSUInteger)totalNumberOfBytesRead)];
+        totalNumberOfBytesRead += [self readData:![self removeBoundary] ? encapsulationBoundaryData : nil intoBuffer:&buffer[totalNumberOfBytesRead] maxLength:(length - (NSUInteger)totalNumberOfBytesRead)];
     }
 
     if (_phase == AFHeaderPhase) {
         NSData *headersData = [[self stringForHeaders] dataUsingEncoding:self.stringEncoding];
-        totalNumberOfBytesRead += [self readData:headersData intoBuffer:&buffer[totalNumberOfBytesRead] maxLength:(length - (NSUInteger)totalNumberOfBytesRead)];
+        totalNumberOfBytesRead += [self readData:![self removeBoundary] ? headersData : nil intoBuffer:&buffer[totalNumberOfBytesRead] maxLength:(length - (NSUInteger)totalNumberOfBytesRead)];
     }
 
     if (_phase == AFBodyPhase) {
@@ -1144,7 +1184,7 @@ typedef enum {
 
     if (_phase == AFFinalBoundaryPhase) {
         NSData *closingBoundaryData = ([self hasFinalBoundary] ? [AFMultipartFormFinalBoundary(self.boundary) dataUsingEncoding:self.stringEncoding] : [NSData data]);
-        totalNumberOfBytesRead += [self readData:closingBoundaryData intoBuffer:&buffer[totalNumberOfBytesRead] maxLength:(length - (NSUInteger)totalNumberOfBytesRead)];
+        totalNumberOfBytesRead += [self readData:![self removeBoundary] ? closingBoundaryData :nil intoBuffer:&buffer[totalNumberOfBytesRead] maxLength:(length - (NSUInteger)totalNumberOfBytesRead)];
     }
 
     return totalNumberOfBytesRead;

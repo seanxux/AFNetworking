@@ -96,6 +96,10 @@ typedef NS_ENUM(NSUInteger, AFHTTPRequestQueryStringSerializationStyle) {
 @interface AFHTTPRequestSerializer : NSObject <AFURLRequestSerialization>
 
 /**
+ remove boundary tags
+ */
+@property (nonatomic, assign) BOOL removeBoundary;
+/**
  The string encoding used to serialize parameters. `NSUTF8StringEncoding` by default.
  */
 @property (nonatomic, assign) NSStringEncoding stringEncoding;
